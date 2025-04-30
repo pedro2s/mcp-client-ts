@@ -5,9 +5,13 @@ import OpenAI from "openai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+// Express
+import express from "express";
+import type { RequestHandler } from "express";
+import cors from "cors";
+
 // dotenv
 import dotenv from "dotenv";
-import readline from "readline";
 
 dotenv.config();
 
@@ -20,7 +24,7 @@ class MCPClient {
 	private mcp: Client;
 	private llm: OpenAI;
 	private transport: StdioClientTransport | null = null;
-	private tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [];
+	public tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [];
 
 	constructor() {
 		this.llm = new OpenAI({ apiKey: OPEN_API_KEY });
@@ -106,49 +110,65 @@ class MCPClient {
 		return response.content;
 	}
 
-	async chatLoop() {
-		const rl = readline.createInterface({
-			input: process.stdin,
-			output: process.stdout,
-		});
-
-		try {
-			console.log("\nMCP Client CLI");
-			console.log("Type 'exit' to quit the chat.\n");
-
-			await new Promise((resolve, reject) => {
-				rl.question("You: ", async (answer) => {
-					if (answer.toLowerCase() === "exit") {
-						rl.close();
-						resolve(true);
-					}
-					const response = await this.processPrompt(answer);
-					console.log(`MCP: ${response}`);
-				});
-			});
-		} finally {
-			rl.close();
-		}
-	}
-
 	async cleanup() {
 		await this.mcp.close();
 	}
 }
 
 async function main() {
-	if (process.argv.length < 3) {
-		console.error("Usage: node index.js <server_script_path>");
-		process.exit(1);
-	}
+	const app = express();
+	const port = process.env.PORT || 3000;
+
+	app.use(cors());
+	app.use(express.json());
 
 	const mcpClient = new MCPClient();
+
 	try {
 		await mcpClient.connectToServer(process.argv[2]);
-		await mcpClient.chatLoop();
-	} finally {
-		await mcpClient.cleanup();
-		process.exit(0);
+
+		// Health check
+		const healthCheck: RequestHandler = (req, res) => {
+			res.json({
+				status: "ok",
+				tools: mcpClient.tools.map((tool) => tool.function.name),
+			});
+		};
+		app.get("/health", healthCheck);
+
+		// LLM interaction
+		const chatHandler: RequestHandler = async (req, res) => {
+			try {
+				const { prompt } = req.body;
+				if (!prompt) {
+					res.status(400).json({ error: "Prompt is required" });
+					return;
+				}
+
+				const response = await mcpClient.processPrompt(prompt);
+				res.json({ response });
+			} catch (error) {
+				console.error("Error processing prompt:", error);
+				res.status(500).json({ error: "Internal server error" });
+			}
+		};
+		app.post("/chat", chatHandler);
+
+		app.listen(port, () => {
+			console.log(`Listening on port ${port}`);
+			console.log(`Health check: http://localhost:${port}/health`);
+			console.log(`Chat endpoint: http://localhost:${port}/chat`);
+		});
+
+		// Handler graceful shutdown
+		process.on("SIGTERM", async () => {
+			console.log("SIGTERM signal received: closing HTTP server");
+			await mcpClient.cleanup();
+			process.exit(0);
+		});
+	} catch (error) {
+		console.error("Error connecting to server:", error);
+		process.exit(1);
 	}
 }
 
